@@ -1,0 +1,44 @@
+name: Disruption Radar Automation
+
+on:
+  # schedule:
+  #   # Run Ingest Pipeline every 2 hours
+  #   - cron: '0 */2 * * *'
+  #   
+  #   # Run Digest Pipeline at 2:30 AM UTC (8:00 AM IST)
+  #   - cron: '30 2 * * *'
+
+  # Allow manual triggering for testing
+  workflow_dispatch:
+    inputs:
+      job_to_run:
+        description: 'Which job to run manually?'
+        required: true
+        default: 'ingest'
+        type: choice
+        options:
+          - ingest
+          - digest
+
+jobs:
+  ingest-news:
+    name: Run Ingestion Pipeline (Every 2 Hours)
+    # Run automatically via schedule OR manually if 'ingest' is selected
+    if: github.event_name == 'schedule' && github.event.schedule == '0 */2 * * *' || github.event.inputs.job_to_run == 'ingest'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Ingest API Route
+        run: |
+          curl -X POST -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+          ${{ secrets.API_BASE_URL }}/api/cron/ingest
+
+  send-digest:
+    name: Send Daily Digest (8:00 AM IST)
+    # Run automatically via schedule OR manually if 'digest' is selected
+    if: github.event_name == 'schedule' && github.event.schedule == '30 2 * * *' || github.event.inputs.job_to_run == 'digest'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Digest API Route
+        run: |
+          curl -X POST -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+          ${{ secrets.API_BASE_URL }}/api/cron/digest

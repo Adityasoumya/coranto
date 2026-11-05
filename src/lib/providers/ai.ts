@@ -1,0 +1,244 @@
+import { GoogleGenAI } from "@google/genai";
+import Groq from "groq-sdk";
+import { metricsStorage, type LlmUsage } from '../metrics';
+
+/**
+ * Thrown when the LLM provider's daily token/request quota is exhausted.
+ * Callers should catch this to abort remaining work gracefully rather than
+ * retrying or falling through to other providers.
+ */
+export class LlmQuotaExhaustedError extends Error {
+  constructor(provider: string, message: string) {
+    super(`[${provider}] Daily quota exhausted: ${message}`);
+    this.name = "LlmQuotaExhaustedError";
+  }
+}
+
+export async function generateEmbedding(text: string): Promise<number[]> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) throw new Error("GEMINI_API_KEY is not set");
+  const ai = new GoogleGenAI({ apiKey: geminiKey });
+  
+  const response = await ai.models.embedContent({
+    model: 'text-embedding-004',
+    contents: text,
+  });
+
+  if (!response.embeddings || response.embeddings.length === 0 || !response.embeddings[0].values) {
+    throw new Error("Failed to generate embedding");
+  }
+
+  return response.embeddings[0].values;
+}
+
+export async function askAI({
+  prompt,
+  schema,
+  preferredModel = "gemini-2.5-flash",
+  groqModelOverride,
+  temperature = 0.2
+}: {
+  prompt: string;
+  schema?: any;
+  preferredModel?: string;
+  groqModelOverride?: string;
+  temperature?: number;
+}) {
+  const llmPrimary = process.env.LLM_PRIMARY || "groq";
+  const groqModel = groqModelOverride || process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+
+  const attemptGemini = async () => {
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) throw new Error("GEMINI_API_KEY is not set");
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+    const config: any = { temperature };
+    if (schema) {
+      config.responseMimeType = "application/json";
+      config.responseSchema = schema;
+    }
+    const response = await ai.models.generateContent({
+      model: preferredModel,
+      contents: prompt,
+      config,
+    });
+    if (!response.text) throw new Error("Gemini returned empty text");
+    
+    if (response.usageMetadata) {
+      const usage: LlmUsage = {
+        promptTokens: response.usageMetadata.promptTokenCount || 0,
+        completionTokens: response.usageMetadata.candidatesTokenCount || 0,
+        totalTokens: response.usageMetadata.totalTokenCount || 0
+      };
+      metricsStorage.getStore()?.addLlmCall(preferredModel, usage);
+    }
+    
+    return response.text;
+  };
+
+  const attemptGroq = async () => {
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) throw new Error("GROQ_API_KEY is not set for Groq");
+    const groq = new Groq({ apiKey: groqKey });
+    
+    // Groq requires an explicit instruction for JSON object mode
+    const fallbackPrompt = schema 
+      ? `${prompt}\n\nIMPORTANT: You must return the output as a valid JSON object exactly matching this JSON Schema structure:\n${JSON.stringify(schema, null, 2)}\n\nDo not return a naked JSON array. It must be a JSON object containing the specified keys.`
+      : prompt;
+
+    try {
+      const chatCompletion = await groq.chat.completions.create({
+        messages: [{ role: "user", content: fallbackPrompt }],
+        model: groqModel,
+        temperature,
+        response_format: schema ? { type: "json_object" } : undefined,
+      });
+
+      let content = chatCompletion.choices[0]?.message?.content;
+      if (!content) throw new Error("Groq returned empty text");
+
+      // Clean markdown block if present
+      if (schema) {
+        content = content.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
+      }
+
+      if (chatCompletion.usage) {
+        const usage: LlmUsage = {
+          promptTokens: chatCompletion.usage.prompt_tokens || 0,
+          completionTokens: chatCompletion.usage.completion_tokens || 0,
+          totalTokens: chatCompletion.usage.total_tokens || 0
+        };
+        metricsStorage.getStore()?.addLlmCall(groqModel, usage);
+      }
+
+      return content;
+    } catch (error: any) {
+      const errMsg = String(error.message || error);
+      // Detect daily token-per-day (TPD) quota exhaustion — distinct from transient 429s
+      if (
+        (error.status === 429 || errMsg.includes('429')) &&
+        (errMsg.toLowerCase().includes('tokens per day') || errMsg.toLowerCase().includes('tpd') || errMsg.toLowerCase().includes('daily'))
+      ) {
+        throw new LlmQuotaExhaustedError('Groq', errMsg);
+      }
+      throw error;
+    }
+  };
+
+  const attemptOpenRouter = async () => {
+    const orKey = process.env.OPENROUTER_API_KEY;
+    if (!orKey) throw new Error("OPENROUTER_API_KEY is not set for OpenRouter");
+    
+    const fallbackPrompt = schema 
+      ? `${prompt}\n\nIMPORTANT: You must return the output as a valid JSON object exactly matching this JSON Schema structure:\n${JSON.stringify(schema, null, 2)}\n\nDo not return a naked JSON array. It must be a JSON object containing the specified keys.`
+      : prompt;
+
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${orKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "meta-llama/llama-3.3-70b-instruct:free",
+        messages: [{ role: "user", content: fallbackPrompt }],
+        temperature,
+        response_format: schema ? { type: "json_object" } : undefined,
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`OpenRouter HTTP error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    let content = data.choices?.[0]?.message?.content;
+    if (!content) throw new Error("OpenRouter returned empty text");
+
+    if (schema) {
+      content = content.replace(/^```json\s*/, '').replace(/```\s*$/, '').trim();
+    }
+
+    if (data.usage) {
+      const usage: LlmUsage = {
+        promptTokens: data.usage.prompt_tokens || 0,
+        completionTokens: data.usage.completion_tokens || 0,
+        totalTokens: data.usage.total_tokens || 0
+      };
+      metricsStorage.getStore()?.addLlmCall(preferredModel, usage);
+    }
+
+    return content;
+  };
+
+  if (llmPrimary === "groq") {
+    try {
+      console.log(`[askAI] Attempting Groq primary (${groqModel})...`);
+      const res = await attemptGroq();
+      console.log(`[askAI] Successfully served by Groq primary.`);
+      return res;
+    } catch (error: any) {
+      // If daily quota exhausted, propagate immediately — do NOT fall through
+      if (error instanceof LlmQuotaExhaustedError) {
+        console.error(`[askAI] ${error.message}`);
+        throw error;
+      }
+      console.error(`[askAI] Groq primary failed. Falling back to OpenRouter. Error:`, error.message || error);
+      try {
+        if (!process.env.OPENROUTER_API_KEY) {
+          throw new Error("OPENROUTER_API_KEY is not set, skipping OpenRouter");
+        }
+        console.log(`[askAI] Attempting OpenRouter fallback (meta-llama/llama-3.3-70b-instruct:free)...`);
+        const res = await attemptOpenRouter();
+        console.log(`[askAI] Successfully served by OpenRouter fallback.`);
+        return res;
+      } catch (orError: any) {
+        console.error(`[askAI] OpenRouter fallback failed. Falling back to Gemini. Error:`, orError.message || orError);
+        try {
+          console.log(`[askAI] Attempting Gemini fallback (${preferredModel})...`);
+          const res = await attemptGemini();
+          console.log(`[askAI] Successfully served by Gemini fallback.`);
+          return res;
+        } catch (geminiError: any) {
+           console.error(`[askAI] Gemini fallback failed:`, geminiError.message || geminiError);
+           throw geminiError;
+        }
+      }
+    }
+  } else {
+    // Current Gemini-first behavior
+    try {
+      console.log(`[askAI] Attempting Gemini primary (${preferredModel})...`);
+      const res = await attemptGemini();
+      console.log(`[askAI] Successfully served by Gemini (${preferredModel}) on first attempt.`);
+      return res;
+    } catch (error: any) {
+      const errString = String(error.message || error);
+      if (error.status === 429 || errString.includes("429") || errString.includes("RESOURCE_EXHAUSTED")) {
+        console.warn(`[askAI] Gemini 429 rate limit hit. Falling back to Groq immediately.`);
+      } else {
+        console.error(`[askAI] Gemini failed with non-429 error. Falling back to Groq. Error:`, error);
+      }
+    }
+
+    // Fallback to Groq
+    try {
+      console.log(`[askAI] Attempting Groq fallback (${groqModel})...`);
+      const res = await attemptGroq();
+      console.log(`[askAI] Successfully served by Groq fallback.`);
+      return res;
+    } catch (groqFallbackErr: any) {
+      // If daily quota exhausted, propagate immediately
+      if (groqFallbackErr instanceof LlmQuotaExhaustedError) {
+        throw groqFallbackErr;
+      }
+      console.error(`[askAI] Groq fallback failed. Falling back to OpenRouter. Error:`, groqFallbackErr.message || groqFallbackErr);
+      if (!process.env.OPENROUTER_API_KEY) {
+        throw new Error("OPENROUTER_API_KEY is not set, skipping OpenRouter and failing completely");
+      }
+      console.log(`[askAI] Attempting OpenRouter fallback (meta-llama/llama-3.3-70b-instruct:free)...`);
+      const res = await attemptOpenRouter();
+      console.log(`[askAI] Successfully served by OpenRouter fallback.`);
+      return res;
+    }
+  }
+}
